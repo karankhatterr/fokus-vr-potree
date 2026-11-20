@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+	<title>FOKUS VR – Potree</title>
+
+	<link rel="stylesheet" type="text/css" href="../build/potree/potree.css">
+	<link rel="stylesheet" type="text/css" href="../libs/jquery-ui/jquery-ui.min.css">
+	<link rel="stylesheet" type="text/css" href="../libs/openlayers3/ol.css">
+	<link rel="stylesheet" type="text/css" href="../libs/spectrum/spectrum.css">
+	<link rel="stylesheet" type="text/css" href="../libs/jstree/themes/mixed/style.css">
+</head>
+
+<body>
+	<script src="../libs/jquery/jquery-3.1.1.min.js"></script>
+	<script src="../libs/spectrum/spectrum.js"></script>
+	<script src="../libs/jquery-ui/jquery-ui.min.js"></script>
+	<script src="../libs/other/BinaryHeap.js"></script>
+	<script src="../libs/tween/tween.min.js"></script>
+	<script src="../libs/d3/d3.js"></script>
+	<script src="../libs/proj4/proj4.js"></script>
+	<script src="../libs/openlayers3/ol.js"></script>
+	<script src="../libs/i18next/i18next.js"></script>
+	<script src="../libs/jstree/jstree.js"></script>
+	<script src="../build/potree/potree.js"></script>
+	<script src="../libs/plasio/js/laslaz.js"></script>
+
+	<div class="potree_container" style="position: absolute; width: 100%; height: 100%; left: 0px; top: 0px;">
+		<div id="potree_render_area"></div>
+		<div id="potree_sidebar_container"></div>
+	</div>
+
+	<script type="module">
+		/*
+		 * FOKUS VR viewer
+		 * ---------------
+		 * Shows the Fraunhofer FOKUS building scans (Potree 2.0 format) in life size,
+		 * so that VR on the Meta Quest 3 feels like standing inside the real building.
+		 *
+		 * Data is NOT part of the repository. Put the recordings here (see docs/SETUP.md):
+		 *   data/fokus/01_small_pushcart_drive_2026-09-08/
+		 *   data/fokus/02_large_husarion_full_floor_2026-10-12/
+		 *
+		 * URL options:
+		 *   ?data=small | large     which recording to load (default: small)
+		 *   &path=0                 hide the robot's path
+		 */
+
+		import * as THREE from "../libs/three.js/build/three.module.js";
+
+		const DATASETS = {
+			small: "../data/fokus/01_small_pushcart_drive_2026-09-08",
+			large: "../data/fokus/02_large_husarion_full_floor_2026-10-12",
+		};
+
+		const EYE_HEIGHT = 1.6;   // desktop camera height above the floor, in metres
+		const FLOOR_Z    = 0.0;   // the recordings start on floor level (z = 0)
+
+		// Potree's VR renderer moves the camera down by 0.8 * scale (see VRControls.js / viewer.renderVR).
+		// With scale 1 we lift the VR origin by the same amount, so the floor of the scan
+		// matches the real floor of the room you are standing in.
+		const VR_RENDER_OFFSET = 0.8;
+
+		const params  = new URLSearchParams(location.search);
+		const dataKey = DATASETS[params.get("data")] ? params.get("data") : "small";
+		const baseUrl = DATASETS[dataKey];
+		const showPath = params.get("path") !== "0";
+
+		window.viewer = new Potree.Viewer(document.getElementById("potree_render_area"));
+
+		viewer.setEDLEnabled(true);
+		viewer.setFOV(75);
+		viewer.setPointBudget(1_000_000);
+		viewer.setMinNodeSize(0);
+		viewer.setBackground("black");
+		viewer.setShowBoundingBox(false);
+		viewer.setControls(viewer.fpControls);
+
+		const other = Object.keys(DATASETS).find(k => k !== dataKey);
+		viewer.setDescription(
+			`Fraunhofer FOKUS, 2nd floor – recording <b>${dataKey}</b>. ` +
+			`<a href="?data=${other}" style="color:#9cf">Switch to ${other}</a>. ` +
+			`Internal data – do not share screenshots.`
+		);
+
+		viewer.loadGUI(() => {
+			viewer.setLanguage("en");
+		});
+
+		// ---------------------------------------------------------------- trajectory
+
+		/** Reads trajectory.txt -> [{x, y, z, heading}] (heading = driving direction in radians). */
+		async function loadTrajectory(url){
+			const response = await fetch(url);
+			if(!response.ok){
+				throw new Error(`Could not load ${url} (${response.status})`);
+			}
+			const text = await response.text();
+
+			const poses = [];
+			for(const line of text.split(/\r?\n/)){
+				if(line.startsWith("#") || line.trim() === ""){
+					continue;
+				}
+				const v = line.split(",").map(Number);
+				// column 5 is "yaw + 180°" (see the dataset README), so the driving direction is yaw - 180°
+				const heading = THREE.MathUtils.degToRad(v[4] - 180);
+				poses.push({x: v[1], y: v[2], z: v[3], heading});
+			}
+			return poses;
+		}
+
+		function addPathLine(poses){
+			const points = poses.map(p => new THREE.Vector3(p.x, p.y, FLOOR_Z + 0.05));
+			const geometry = new THREE.BufferGeometry().setFromPoints(points);
+			const material = new THREE.LineBasicMaterial({color: 0x00aaff});
+			const line = new THREE.Line(geometry, material);
+			line.name = "robot path";
+			viewer.scene.scene.add(line);
+			return line;
+		}
+
+		/** Places the desktop camera at the robot's start pose, at eye height, looking along the path. */
+		function goToStart(pose){
+			const pos = new THREE.Vector3(pose.x, pose.y, FLOOR_Z + EYE_HEIGHT);
+			const dir = new THREE.Vector3(Math.cos(pose.heading), Math.sin(pose.heading), 0);
+			viewer.scene.view.setView(pos, pos.clone().add(dir));
+		}
+
+		// ---------------------------------------------------------------- point cloud
+
+		Potree.loadPointCloud(`${baseUrl}/pointcloud_potree/metadata.json`, `fokus_${dataKey}`, async (e) => {
+			const pointcloud = e.pointcloud;
+			viewer.scene.addPointCloud(pointcloud);
+
+			const material = pointcloud.material;
+			material.activeAttributeName = "rgba";
+			// Fixed screen-size points look much cleaner up close (indoors) than adaptive ones.
+			material.pointSizeType = Potree.PointSizeType.FIXED;
+			material.size = 3;
+
+			// Potree picks the move speed from the bounding box (~15–25 here). In VR that speed is
+			// also the world scale, so you would be 15–25x too big. Speed 1 = life size.
+			viewer.setMoveSpeed(1);
+
+			try{
+				const poses = await loadTrajectory(`${baseUrl}/trajectory.txt`);
+				if(showPath){
+					addPathLine(poses);
+				}
+				goToStart(poses[0]);
+			}catch(err){
+				console.warn(err);
+				goToStart({x: 0, y: 0, heading: 0});
+			}
+		});
+
+		// ---------------------------------------------------------------- VR
+
+		// Runs after Potree's own VRControls.onStart, which copies the desktop camera pose.
+		viewer.addEventListener("vr_start", () => {
+			const vr = viewer.vrControls;
+			vr.node.scale.set(1, 1, 1);
+			vr.node.position.z = FLOOR_Z + VR_RENDER_OFFSET;
+			vr.node.updateMatrix();
+			vr.node.updateMatrixWorld();
+		});
+	</script>
+</body>
+</html>
